@@ -1,0 +1,162 @@
+# Puerto en el que arranca este servicio Java. Lo llamas en http://localhost:8082
+server:
+  port: 8082
+
+spring:
+  application:
+    # Nombre del servicio. Aparece en los logs y en las métricas de Grafana
+    name: notification-service
+
+  datasource:
+    # URL de conexión a Postgres. Si no hay variable de entorno NOTIFICATION_DB_URL, usa localhost:5432
+    url: ${NOTIFICATION_DB_URL:jdbc:postgresql://localhost:5432/app}
+    username: ${NOTIFICATION_DB_USERNAME:app}
+    password: ${NOTIFICATION_DB_PASSWORD:app}
+
+  jpa:
+    hibernate:
+      # "update" = Hibernate crea/modifica las tablas automáticamente al arrancar
+      # En producción usarías "validate" o "none" y gestionarías el schema con Flyway/Liquibase
+      ddl-auto: update
+    open-in-view: false
+    properties:
+      hibernate:
+        # Schema de Postgres donde se crearán las tablas de este servicio
+        # Las tablas de notificaciones estarán en: notifications.notifications, notifications.knowledge_chunks
+        default_schema: notifications
+
+  sql:
+    init:
+      # "always" = ejecutar el schema.sql siempre al arrancar (no solo la primera vez)
+      # Necesario para crear la extensión pgvector y la tabla de knowledge_chunks
+      mode: always
+      # Ruta al fichero SQL que crea las tablas de pgvector (extensión vector, tabla knowledge_chunks)
+      schema-locations: classpath:schema.sql
+
+  kafka:
+    # Dirección del broker Kafka/Redpanda. Puerto 19092 es el que expone Docker al host (tu máquina)
+    # Puerto 9092 es solo para comunicación interna entre contenedores Docker
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:19092}
+
+    consumer:
+      # Nombre del grupo de consumidores. Kafka/Redpanda recuerda hasta dónde ha leído cada grupo
+      # Si el servicio se cae y vuelve, retoma desde donde lo dejó (no pierde mensajes)
+      group-id: notification-service
+      # Qué hacer si este consumer group nunca ha leído el topic: empezar desde el principio
+      # "latest" empezaría solo desde los mensajes nuevos (posteriores al arranque)
+      auto-offset-reset: earliest
+      # Cómo se deserializa la KEY del mensaje (bytes → String)
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      # Cómo se deserializa el VALUE del mensaje (bytes → JSON → objeto Java)
+      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
+      properties:
+        # Confiar en mensajes JSON de cualquier paquete Java (necesario para deserializar el evento)
+        spring.json.trusted.packages: "*"
+        # Si el JSON no tiene cabecera indicando el tipo, asumir que es OrderCreatedEvent
+        spring.json.value.default.type: es.tirea.notificationservice.domain.model.OrderCreatedEvent
+
+    producer:
+      # Cómo se serializa la KEY del mensaje (String → bytes)
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      # Cómo se serializa el VALUE del mensaje (objeto Java → JSON → bytes)
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      properties:
+        # No añadir cabeceras con el tipo Java al JSON. Así el mensaje es más limpio
+        spring.json.add.type.headers: false
+
+    listener:
+      # Activar trazabilidad OpenTelemetry en la recepción de mensajes Kafka
+      observation-enabled: true
+      # ack-mode: record = confirmar (ack) cada mensaje individualmente al procesarlo
+      # Si falla un mensaje, Kafka no avanza el offset hasta que se confirme o vaya al DLQ
+      ack-mode: record
+
+    template:
+      # Activar trazabilidad OpenTelemetry en el envío de mensajes Kafka (para el DLQ)
+      observation-enabled: true
+
+    admin:
+      # Si Kafka no está disponible al arrancar, no falla. Solo avisa y sigue intentando
+      fail-fast: false
+
+# Configuración de métricas y observabilidad (Actuator, Prometheus, OpenTelemetry)
+management:
+  endpoints:
+    web:
+      exposure:
+        # Endpoints de Actuator que se exponen: /actuator/health, /actuator/info, /actuator/prometheus
+        # /actuator/prometheus es el que Prometheus scrapea para recoger métricas
+        include: health,info,prometheus
+  endpoint:
+    health:
+      probes:
+        # Activa /actuator/health/liveness y /actuator/health/readiness (para Kubernetes)
+        enabled: true
+  metrics:
+    tags:
+      # Etiqueta que se añade a todas las métricas. Permite filtrar por servicio en Grafana
+      application: ${spring.application.name}
+  tracing:
+    sampling:
+      # 0.0 = no enviar trazas al OTel Collector (evita errores en local si el collector no responde)
+      # Cambia a 1.0 cuando quieras ver trazas en Jaeger (http://localhost:16686)
+      probability: 0.0
+  otlp:
+    tracing:
+      # URL del OTel Collector donde se envían las trazas. Docker lo expone en puerto 4318
+      endpoint: ${OTEL_EXPORTER_OTLP_ENDPOINT:http://127.0.0.1:4318/v1/traces}
+
+logging:
+  pattern:
+    # Formato de los logs. Incluye traceId y spanId para correlacionar logs con trazas en Jaeger
+    level: "%5p traceId=%X{traceId:-} spanId=%X{spanId:-}"
+
+# Configuración propia de la aplicación (no de Spring, sino nuestra)
+app:
+  kafka:
+    topics:
+      # Nombre del topic Kafka del que este servicio consume los eventos de pedido creado
+      order-events: order-events
+      # Topic donde van los mensajes que fallaron tras todos los reintentos (Dead Letter Queue)
+      # Si procesar un evento falla 3 veces, el mensaje se mueve aquí para no perderlo
+      order-events-dlq: order-events-dlq
+    retry:
+      # Número máximo de intentos antes de mandar el mensaje al DLQ
+      max-attempts: 3
+      # Tiempo de espera entre reintentos (en milisegundos). 1000ms = 1 segundo
+      backoff-ms: 1000
+
+  ai:
+    # Qué proveedor de IA usar: "fake" (sin llamadas reales) o "bedrock" (AWS)
+    # Valor por defecto: "fake". Para usar Bedrock, pon AI_PROVIDER=bedrock como variable de entorno
+    provider: ${AI_PROVIDER:fake}
+    # Cuántos fragmentos del knowledge base recuperar por consulta RAG (top-K más similares)
+    top-k: 3
+    # Longitud máxima del cuerpo de la notificación (en caracteres). El guardrail trunca si supera esto
+    max-body-length: 500
+    # Canales de notificación permitidos. Si el LLM devuelve otro canal, el guardrail lo rechaza
+    allowed-channels: email,sms,push
+    # Dimensión de los vectores de embedding que genera FakeEmbeddingAdapter
+    # Debe coincidir con la dimensión de la columna vector en la base de datos
+    embedding-dimension: 32
+
+    bedrock:
+      # Región de AWS donde está Bedrock. Por defecto us-east-1 (la más común)
+      region: ${AWS_REGION:us-east-1}
+      # Modelo de texto (LLM) a usar en Bedrock. Claude 3.5 Sonnet por defecto
+      # Este modelo genera el JSON de notificación a partir del prompt + contexto RAG
+      text-model-id: ${BEDROCK_TEXT_MODEL_ID:anthropic.claude-3-5-sonnet-20241022-v2:0}
+      # Modelo de embeddings a usar en Bedrock. Amazon Titan Embeddings por defecto
+      # Este modelo convierte texto → vector numérico para buscar en pgvector
+      embedding-model-id: ${BEDROCK_EMBEDDING_MODEL_ID:amazon.titan-embed-text-v2:0}
+
+---
+# Este bloque solo se activa cuando el perfil "test" está activo (al correr ./mvnw test)
+spring:
+  config:
+    activate:
+      on-profile: test
+  jpa:
+    hibernate:
+      # En tests: crea las tablas al inicio y las borra al final. Empieza siempre limpio
+      ddl-auto: create-drop

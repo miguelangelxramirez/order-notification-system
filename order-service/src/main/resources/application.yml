@@ -1,0 +1,102 @@
+# Puerto en el que arranca este servicio Java. Lo llamas en http://localhost:8081
+server:
+  port: 8081
+
+spring:
+  application:
+    # Nombre del servicio. Aparece en los logs y en las métricas de Grafana
+    name: order-service
+
+  datasource:
+    # URL de conexión a Postgres. Si no hay variable de entorno ORDER_DB_URL, usa localhost:5432
+    # El :5432 es el puerto de Postgres (el que expone Docker Compose)
+    url: ${ORDER_DB_URL:jdbc:postgresql://localhost:5432/app}
+    username: ${ORDER_DB_USERNAME:app}
+    password: ${ORDER_DB_PASSWORD:app}
+
+  jpa:
+    hibernate:
+      # "update" = Hibernate crea/modifica las tablas automáticamente al arrancar
+      # En producción usarías "validate" o "none" y gestionarías el schema con Flyway/Liquibase
+      ddl-auto: update
+    open-in-view: false
+    properties:
+      hibernate:
+        # Schema de Postgres donde se crearán las tablas de este servicio
+        # Las tablas de orders estarán en: orders.orders
+        default_schema: orders
+
+  kafka:
+    # Dirección del broker Kafka/Redpanda. Puerto 19092 es el que expone Docker al host (tu máquina)
+    # Puerto 9092 es solo para comunicación interna entre contenedores Docker
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:19092}
+    producer:
+      # Cómo se serializa la KEY del mensaje (String → bytes)
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      # Cómo se serializa el VALUE del mensaje (objeto Java → JSON → bytes)
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      properties:
+        # No añadir cabeceras con el tipo Java al JSON. Así el mensaje es más limpio
+        spring.json.add.type.headers: false
+    admin:
+      # Si Kafka no está disponible al arrancar, no falla. Solo avisa y sigue intentando
+      fail-fast: false
+    template:
+      # Activar trazabilidad OpenTelemetry en el envío de mensajes Kafka
+      observation-enabled: true
+
+# Configuración de métricas y observabilidad (Actuator, Prometheus, OpenTelemetry)
+management:
+  endpoints:
+    web:
+      exposure:
+        # Endpoints de Actuator que se exponen: /actuator/health, /actuator/info, /actuator/prometheus
+        # /actuator/prometheus es el que Prometheus scrapea para recoger métricas
+        include: health,info,prometheus
+  endpoint:
+    health:
+      probes:
+        # Activa /actuator/health/liveness y /actuator/health/readiness (para Kubernetes)
+        enabled: true
+  metrics:
+    tags:
+      # Etiqueta que se añade a todas las métricas. Permite filtrar por servicio en Grafana
+      application: ${spring.application.name}
+  tracing:
+    sampling:
+      # 0.0 = no enviar trazas al OTel Collector (evita errores en local si el collector no responde)
+      # Cambia a 1.0 cuando quieras ver trazas en Jaeger (http://localhost:16686)
+      probability: 0.0
+  otlp:
+    tracing:
+      # URL del OTel Collector donde se envían las trazas. Docker lo expone en puerto 4318
+      endpoint: ${OTEL_EXPORTER_OTLP_ENDPOINT:http://127.0.0.1:4318/v1/traces}
+
+logging:
+  pattern:
+    # Formato de los logs. Incluye traceId y spanId para correlacionar logs con trazas en Jaeger
+    level: "%5p traceId=%X{traceId:-} spanId=%X{spanId:-}"
+
+# Configuración propia de la aplicación (no de Spring, sino nuestra)
+app:
+  kafka:
+    topics:
+      # Nombre del topic Kafka donde se publican los eventos de pedido creado
+      order-events: order-events
+  notifications:
+    http:
+      # Feature flag: si true, además de Kafka también notifica por HTTP al notification-service
+      # false por defecto. El flujo principal es siempre por Kafka
+      enabled: ${NOTIFICATIONS_HTTP_ENABLED:false}
+      url: ${NOTIFICATION_SERVICE_URL:http://localhost:8082/notifications}
+
+---
+# Este bloque solo se activa cuando el perfil "test" está activo (al correr ./mvnw test)
+spring:
+  config:
+    activate:
+      on-profile: test
+  jpa:
+    hibernate:
+      # En tests: crea las tablas al inicio y las borra al final. Empieza siempre limpio
+      ddl-auto: create-drop
